@@ -3,45 +3,34 @@
 Undirected multigraph (parallel edges allowed, self loops forbidden) with
 positive integer edge lengths.  Finds the minimum added length needed for all
 vertices to have even degree, the exact number of optimal duplicate sets, the
-canonical duplicate set (0-preferred bit vector in edge order), per-edge
-classification, and a closed Euler tour for the canonical augmentation.
+canonical duplicate set (0-preferred bit vector in identifier order),
+per-edge classification, and a closed Euler tour for the canonical
+augmentation.
 
-Exact counting without enumeration
-----------------------------------
-A duplicate set is a T-join: in the subgraph formed by the duplicated edges
-exactly the originally odd vertices T have odd degree.  T-join theorem:
+Exact counting by meet-in-the-middle over edge subsets
+------------------------------------------------------
+A duplicate set is a T-join for the set T of originally odd vertices: the
+subgraph formed by the duplicated edges has odd degree exactly on T.  The
+number of *distinct* minimum-weight T-joins cannot in general be read off
+the shortest-path matching DP: a join that is a symmetric difference of
+shortest paths can admit several matching/path decompositions (when the
+shortest paths of one matching meet at vertices, the pairing re-splits into
+another minimum matching yielding the same edge set).
 
-  * minimum T-join weight = minimum weight of a perfect matching of T under
-    the shortest-path metric;
-  * every minimum T-join decomposes into edge-disjoint shortest paths whose
-    endpoint pairs form such a minimum matching.
+With at most 32 edges the exact answer is obtained by meet-in-the-middle:
+split edges into two halves of <=16 edges, enumerate all 2**16 subsets per
+half, and aggregate them by (parity bit vector over the vertices, weight).
+A full subset is uniquely the disjoint union of its two halves, so joining
+the half tables counts distinct edge sets with no over-counting:
 
-For each odd pair (i, j) let A[i][j] be the number of shortest i-j paths
-(parallel edges count separately).  Choices for the pairs of a matching are
-independent -- two shortest paths of pairs inside one minimum matching cannot
-share an edge, because their edge-union would then be a strictly cheaper
-T-join.  Hence the number of optimal sets for a matching M is the product of
-A[i][j] over its pairs, and different matchings give different sets.  The
-total count is obtained by a weighted subset DP without ever enumerating the
-sets:
+    optimum  = min over p of  minW_L[p] + minW_R[T xor p]
+    count    = sum over p of  C_L[p][w] * C_R[T xor p][optimum - w]
 
-    C[S] = sum over min-cost partners j of the first vertex:
-               A[i][j] * C[S \\ {i, j}]
-
-For per-edge classification, let B_e[i][j] be the number of shortest i-j
-paths that use edge e (forward/backward shortest-path-count product through
-the edge).  A second DP G_e[S] counts optimal sets for subproblem S that
-contain e, using B_e for the pair whose path carries e and A - B_e otherwise:
-
-    G_e[S] = sum over min-cost partners j:
-               B_e[i][j] * C[S'] + (A[i][j] - B_e[i][j]) * G_e[S']
-
-Edge e is required when G_e[T] == C[T], optional for 0 < G_e[T] < C[T], and
-never duplicated when G_e[T] == 0.
-
-The canonical set is built greedily in edge order: bit p is 0 whenever an
-optimum T-join still exists with the edges pinned so far, the newly forced
-edges toggling the parity target.
+Per-edge membership among the optimum sets uses the same half tables built
+with that edge forced inside the subset; the 0-preferred canonical vector is
+fixed greedily by testing whether an optimum join still exists with the
+identifier-order prefix pinned (feasibility = min half weights under pins
+still sum to the optimum).
 """
 
 from __future__ import annotations
@@ -339,47 +328,206 @@ def shortest_path_masks(
 
 
 # ---------------------------------------------------------------------------
-# Perfect matching DP over a subset of vertices
+# Meet-in-the-middle over edge subsets (<= 32 edges, halves of <= 16)
 # ---------------------------------------------------------------------------
 
 
-def matching_dp(dist_matrix, labels: Sequence[int]):
-    """Minimum matching cost and number of matchings attaining it.
+def _half_enumeration(half_edges: Sequence[Edge], node_index: Dict[str, int]):
+    """Every subset of one edge half via Gray-code flipping.
 
-    dist_matrix[i][j] is the shortest-path distance; INF means unreachable.
-    Returns (cost array by mask, count array by mask).
+    Returns ``(parities, weights)`` arrays indexed by subset mask: the
+    subgraph's odd-vertex bit vector (node indices) and total length.  Each
+    Gray step adds/removes exactly one edge, so both values stay O(1).
     """
-    k = len(labels)
-    size = 1 << k
-    cost = [INF] * size
-    count = [0] * size
-    cost[0] = 0
-    count[0] = 1
-    for mask in range(1, size):
-        if mask.bit_count() & 1:
+    h = len(half_edges)
+    size = 1 << h
+    parities = [0] * size
+    weights = [0] * size
+    edge_parity = [
+        (1 << node_index[e.u]) | (1 << node_index[e.v]) for e in half_edges
+    ]
+    edge_len = [e.length for e in half_edges]
+    cur_p = 0
+    cur_w = 0
+    prev_gray = 0
+    for s in range(1, size):
+        gray = s ^ (s >> 1)
+        changed = gray ^ prev_gray
+        j = changed.bit_length() - 1
+        cur_p ^= edge_parity[j]
+        if gray & changed:
+            cur_w += edge_len[j]
+        else:
+            cur_w -= edge_len[j]
+        parities[gray] = cur_p
+        weights[gray] = cur_w
+        prev_gray = gray
+    return parities, weights
+
+
+def _aggregate_min(parities, weights, included: int, allowed: int):
+    """Minimum weight per parity and number of subsets attaining it.
+
+    Only subsets of ``allowed`` that contain every bit of ``included`` are
+    considered; sub-subsets of ``allowed`` are enumerated directly so the
+    cost shrinks as more bits get pinned away.
+    """
+    table: Dict[int, List] = {}  # parity -> [min_weight, count]
+
+    def visit(s: int):
+        p = parities[s]
+        w = weights[s]
+        row = table.get(p)
+        if row is None:
+            table[p] = [w, 1]
+        elif w < row[0]:
+            row[0] = w
+            row[1] = 1
+        elif w == row[0]:
+            row[1] += 1
+
+    sub = allowed
+    while True:
+        if (sub & included) == included:
+            visit(sub)
+        if sub == 0:
+            break
+        sub = (sub - 1) & allowed
+    return table
+
+
+def _detailed_table(parities, weights) -> Dict[int, Dict[int, int]]:
+    """parity -> {weight -> number of subsets} for every subset of a half."""
+    table: Dict[int, Dict[int, int]] = {0: {0: 1}}
+    for s in range(1, len(parities)):
+        p = parities[s]
+        w = weights[s]
+        bucket = table.get(p)
+        if bucket is None:
+            table[p] = {w: 1}
+        else:
+            bucket[w] = bucket.get(w, 0) + 1
+    return table
+
+
+def _join_min(left: Dict[int, list], right: Dict[int, list], target: int):
+    """Min weight and number of distinct half-unions with parity ``target``.
+
+    A full subset is the unique disjoint union of its two halves, so every
+    counted pair is one distinct edge set -- no matching/path decomposition
+    can inflate the number.
+    """
+    if len(left) > len(right):
+        left, right = right, left
+    best = INF
+    total = 0
+    for p, row_l in left.items():
+        row_r = right.get(target ^ p)
+        if row_r is None:
             continue
-        i = (mask & -mask).bit_length() - 1
-        rest0 = mask ^ (1 << i)
-        best = INF
-        total = 0
-        bits = rest0
-        while bits:
-            jb = bits & -bits
-            j = jb.bit_length() - 1
-            bits ^= jb
-            d = dist_matrix[i][j]
-            sub = rest0 ^ jb
-            if d >= INF or cost[sub] >= INF:
+        val = row_l[0] + row_r[0]
+        ways = row_l[1] * row_r[1]
+        if val < best:
+            best = val
+            total = ways
+        elif val == best:
+            total += ways
+    return best, total
+
+
+def _count_with_local_bit(parities, weights, other_detail, target, optimum, bit):
+    total = 0
+    other_bits = (len(parities) - 1) ^ bit
+    sub = other_bits
+    while True:
+        s = sub | bit
+        bucket = other_detail.get(target ^ parities[s])
+        if bucket is not None:
+            total += bucket.get(optimum - weights[s], 0)
+        if sub == 0:
+            break
+        sub = (sub - 1) & other_bits
+    return total
+
+
+def solve_tjoins(nodes: Sequence[str], edges: Sequence[Edge], odd: Sequence[str]):
+    """Exact optimum, distinct-set count, membership and canonical vector.
+
+    Returns (optimum, total_count, in_any_bits, in_all_bits, canonical_mask).
+    """
+    node_index = {n: i for i, n in enumerate(nodes)}
+    m = len(edges)
+    cut = m // 2
+    left_edges = edges[:cut]
+    right_edges = edges[cut:]
+    lp, lw = _half_enumeration(left_edges, node_index)
+    rp, rw = _half_enumeration(right_edges, node_index)
+
+    l_all = (1 << len(left_edges)) - 1
+    r_all = (1 << len(right_edges)) - 1
+    left_min = _aggregate_min(lp, lw, 0, l_all)
+    right_min = _aggregate_min(rp, rw, 0, r_all)
+    target = 0
+    for n in odd:
+        target |= 1 << node_index[n]
+
+    optimum, total_count = _join_min(left_min, right_min, target)
+
+    # per-edge membership among optimum sets: an edge belongs to some/all
+    # optimal joins according to how many optimum sets contain it.
+    left_detail = _detailed_table(lp, lw)
+    right_detail = _detailed_table(rp, rw)
+    in_any = 0
+    in_all = 0
+    for j, e in enumerate(left_edges):
+        c = _count_with_local_bit(
+            lp, lw, right_detail, target, optimum, 1 << j
+        )
+        if c:
+            in_any |= 1 << e.index
+            if c == total_count:
+                in_all |= 1 << e.index
+    for j, e in enumerate(right_edges):
+        c = _count_with_local_bit(
+            rp, rw, left_detail, target, optimum, 1 << j
+        )
+        if c:
+            in_any |= 1 << e.index
+            if c == total_count:
+                in_all |= 1 << e.index
+
+    # 0-preferred canonical vector: walk edges in identifier order and pin
+    # 0 whenever an optimum join consistent with the prefix pins still exists.
+    inc_l = exc_l = inc_r = exc_r = 0
+    canonical_mask = 0
+    for e in edges:
+        if e.index < cut:
+            j = e.index
+            bit = 1 << j
+            trial_exc = exc_l | bit
+            lm = _aggregate_min(lp, lw, inc_l, l_all & ~trial_exc)
+            rm = _aggregate_min(rp, rw, inc_r, r_all & ~exc_r)
+            feasible, _ = _join_min(lm, rm, target)
+            if feasible == optimum:
+                exc_l = trial_exc
                 continue
-            val = d + cost[sub]
-            if val < best:
-                best = val
-                total = count[sub]
-            elif val == best:
-                total += count[sub]
-        cost[mask] = best
-        count[mask] = total
-    return cost, count
+            exc_l &= ~bit
+            inc_l |= bit
+        else:
+            j = e.index - cut
+            bit = 1 << j
+            trial_exc = exc_r | bit
+            lm = _aggregate_min(lp, lw, inc_l, l_all & ~exc_l)
+            rm = _aggregate_min(rp, rw, inc_r, r_all & ~trial_exc)
+            feasible, _ = _join_min(lm, rm, target)
+            if feasible == optimum:
+                exc_r = trial_exc
+                continue
+            exc_r &= ~bit
+            inc_r |= bit
+        canonical_mask |= 1 << e.index
+
+    return optimum, total_count, in_any, in_all, canonical_mask
 
 
 # ---------------------------------------------------------------------------
@@ -445,97 +593,6 @@ def euler_circuit(
 
 
 # ---------------------------------------------------------------------------
-# Enumeration of the distinct optimal T-join edge sets
-# ---------------------------------------------------------------------------
-
-
-def enumerate_optimal_tjoins(
-    odd: Tuple[str, ...],
-    dist_from: Dict[str, dict],
-    nadj,
-    costdp,
-    dist_matrix,
-):
-    """All distinct minimum T-join masks for the odd vertices.
-
-    dp[mask] is the set of distinct edge masks of optimal T-joins pairing
-    exactly the odd vertices in ``mask``.  Anchor the lowest-index vertex i
-    and combine a shortest i-j path with an optimal solution of the remaining
-    mask via symmetric difference; integer masks deduplicate automatically.
-    The matching cost DP gates which partners j can occur in an optimum.
-    """
-    k = len(odd)
-    size = 1 << k
-    pair_cache: Dict[Tuple[int, int], Tuple[int, ...]] = {}
-
-    def paths_between(a: int, b: int) -> Tuple[int, ...]:
-        key = (a, b)
-        if key not in pair_cache:
-            pair_cache[key] = shortest_path_masks(
-                nadj, odd[a], odd[b], dist_from[odd[a]]
-            )
-        return pair_cache[key]
-
-    edge_count = 1 + max(
-        ei for incident in nadj.values() for _, ei, _ in incident
-    )
-    vector_weight = tuple(1 << (edge_count - 1 - i) for i in range(edge_count))
-
-    def vector_rank(edge_mask: int) -> int:
-        rank = 0
-        bits = edge_mask
-        while bits:
-            bit = bits & -bits
-            rank += vector_weight[bit.bit_length() - 1]
-            bits ^= bit
-        return rank
-
-    dp: List[Optional[Tuple[int, int, int, int]]] = [None] * size
-    dp[0] = (1, 0, 0, 0)
-    for mask in range(1, size):
-        if mask.bit_count() & 1:
-            continue
-        ib = mask & -mask
-        i = ib.bit_length() - 1
-        rest0 = mask ^ ib
-        target_cost = costdp[mask]
-        total = 0
-        canonical: Optional[int] = None
-        in_any = 0
-        in_all: Optional[int] = None
-        represented: set[int] = set()
-        bits = rest0
-        while bits:
-            jb = bits & -bits
-            j = jb.bit_length() - 1
-            bits ^= jb
-            sub = rest0 ^ jb
-            if dist_matrix[i][j] >= INF or costdp[sub] >= INF:
-                continue
-            if dist_matrix[i][j] + costdp[sub] != target_cost:
-                continue
-            sub_summary = dp[sub]
-            if sub_summary is None:
-                continue
-            sub_count, sub_canonical, sub_any, sub_all = sub_summary
-            for pmask in paths_between(i, j):
-                candidate = pmask ^ sub_canonical
-                if candidate in represented:
-                    continue
-                represented.add(candidate)
-                if canonical is None or vector_rank(candidate) < vector_rank(canonical):
-                    canonical = candidate
-                candidate_any = pmask | sub_any
-                candidate_all = pmask | sub_all
-                total += sub_count
-                in_any |= candidate_any
-                in_all = candidate_all if in_all is None else in_all & candidate_all
-        if canonical is not None and in_all is not None:
-            dp[mask] = (total, canonical, in_any, in_all)
-    return dp[size - 1]
-
-
-# ---------------------------------------------------------------------------
 # Main audit
 # ---------------------------------------------------------------------------
 
@@ -583,26 +640,15 @@ def audit(
             route=tuple(route),
         )
 
-    # shortest distances from every vertex
-    nadj = build_nadj(nodes, edges)
-    dist_from: Dict[str, dict] = {s: dijkstra(nodes, nadj, s) for s in nodes}
-
-    k = len(odd)
-    D = [[INF] * k for _ in range(k)]
-    for i, s in enumerate(odd):
-        for j, t in enumerate(odd):
-            if t in dist_from[s]:
-                D[i][j] = dist_from[s][t]
-
-    costdp, _ = matching_dp(D, list(range(k)))
-    full = (1 << k) - 1
-    optimum = costdp[full]
-
-    # distinct optimal duplicate sets, exact
-    total_count, canonical_mask, in_any, in_all = enumerate_optimal_tjoins(
-        odd, dist_from, nadj, costdp, D
+    # exact distinct-set count, membership and canonical vector via
+    # meet-in-the-middle over edge subsets (matching DP representations can
+    # describe the same edge set multiple times and cannot be used directly)
+    optimum, total_count, in_any, in_all, canonical_mask = solve_tjoins(
+        nodes, edges, odd
     )
-    bit_vector = "".join("1" if canonical_mask >> i & 1 else "0" for i in range(m))
+    bit_vector = "".join(
+        "1" if canonical_mask >> i & 1 else "0" for i in range(m)
+    )
 
     classification: Dict[int, str] = {}
     for i in range(m):

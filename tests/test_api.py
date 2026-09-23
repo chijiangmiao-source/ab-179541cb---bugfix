@@ -17,6 +17,83 @@ K4 = {
 }
 
 
+# The reported six-node inspection network (edges intentionally NOT given in
+# identifier order): two co-optimal duplicate sets, canonical 101000101.
+INSPECTION = {
+    "nodes": ["A", "B", "C", "D", "E", "F"],
+    "edges": [
+        {"id": "e0", "u": "F", "v": "E", "length": 3},
+        {"id": "e1", "u": "E", "v": "C", "length": 1},
+        {"id": "e2", "u": "C", "v": "A", "length": 6},
+        {"id": "e3", "u": "A", "v": "B", "length": 6},
+        {"id": "e4", "u": "B", "v": "D", "length": 2},
+        {"id": "e5", "u": "E", "v": "C", "length": 5},
+        {"id": "e6", "u": "D", "v": "A", "length": 1},
+        {"id": "e7", "u": "A", "v": "D", "length": 5},
+        {"id": "e8", "u": "B", "v": "A", "length": 1},
+    ],
+    "start": "A",
+}
+
+
+def test_inspection_payload_exact():
+    r = run_audit(INSPECTION)
+    assert r["ok"] is True
+    assert r["totalLength"] == 30
+    assert r["addedLength"] == 11
+    assert r["optimalCount"] == 2
+    assert r["canonicalVector"] == "101000101"
+    assert r["canonicalEdges"] == ["e0", "e2", "e6", "e8"]
+    by_id = {e["id"]: e for e in r["edges"]}
+    assert by_id["e0"]["classification"] == "required"
+    assert by_id["e2"]["classification"] == "required"
+    for eid in ("e4", "e6", "e8"):
+        assert by_id[eid]["classification"] == "optional"
+    for eid in ("e1", "e3", "e5", "e7"):
+        assert by_id[eid]["classification"] == "never"
+    # canonical duplication reflected per edge
+    for eid in ("e0", "e2", "e6", "e8"):
+        assert by_id[eid]["duplicated"] is True
+        assert by_id[eid]["copies"] == 2
+    for eid in ("e1", "e3", "e4", "e5", "e7"):
+        assert by_id[eid]["duplicated"] is False
+        assert by_id[eid]["copies"] == 1
+    # closed route starting/ending at A with exact copy usage
+    route = r["route"]
+    assert len(route) == 13
+    assert route[0]["from"] == "A" and route[-1]["to"] == "A"
+    usage = {}
+    cur = "A"
+    for st in route:
+        assert st["from"] == cur
+        usage[st["edgeId"]] = usage.get(st["edgeId"], 0) + 1
+        cur = st["to"]
+    assert cur == "A"
+    for eid in ("e0", "e2", "e6", "e8"):
+        assert usage[eid] == 2
+    for eid in ("e1", "e3", "e4", "e5", "e7"):
+        assert usage[eid] == 1
+
+
+def test_inspection_payload_order_independent():
+    payload = {
+        "nodes": INSPECTION["nodes"],
+        "edges": list(reversed(INSPECTION["edges"])),
+        "start": "A",
+    }
+    r = run_audit(payload)
+    assert r["optimalCount"] == 2
+    assert r["addedLength"] == 11
+    assert r["canonicalVector"] == "101000101"
+    assert r["canonicalEdges"] == ["e0", "e2", "e6", "e8"]
+    by_id = {e["id"]: e["classification"] for e in r["edges"]}
+    assert by_id == {
+        "e0": "required", "e1": "never", "e2": "required", "e3": "never",
+        "e4": "optional", "e5": "never", "e6": "optional",
+        "e7": "never", "e8": "optional",
+    }
+
+
 def test_success_payload():
     r = run_audit(K4)
     assert r["ok"] is True

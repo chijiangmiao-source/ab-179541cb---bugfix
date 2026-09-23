@@ -58,6 +58,77 @@ BAD = {
     "start": "A",
 }
 
+# Six-node inspection network: two co-optimal minimum augmentation sets,
+# canonical 0-preferred vector 101000101; edges entered in identifier order.
+INSPECTION = {
+    "nodes": ["A", "B", "C", "D", "E", "F"],
+    "edges": [
+        {"id": "e0", "u": "F", "v": "E", "length": 3},
+        {"id": "e1", "u": "E", "v": "C", "length": 1},
+        {"id": "e2", "u": "C", "v": "A", "length": 6},
+        {"id": "e3", "u": "A", "v": "B", "length": 6},
+        {"id": "e4", "u": "B", "v": "D", "length": 2},
+        {"id": "e5", "u": "E", "v": "C", "length": 5},
+        {"id": "e6", "u": "D", "v": "A", "length": 1},
+        {"id": "e7", "u": "A", "v": "D", "length": 5},
+        {"id": "e8", "u": "B", "v": "A", "length": 1},
+    ],
+    "start": "A",
+}
+
+# Same network with the edge rows reversed; audit conclusions must be
+# identical because they are keyed by edge identifier.
+INSPECTION_REVERSED = {
+    "nodes": INSPECTION["nodes"],
+    "edges": list(reversed(INSPECTION["edges"])),
+    "start": "A",
+}
+
+
+def check_inspection(body):
+    check(body.get("totalLength") == 30, "巡检管网原总长 30")
+    check(body.get("addedLength") == 11, "巡检管网最小增加长度 11")
+    check(body.get("optimalCount") == 2, "巡检管网并列最优数量为 2")
+    check(
+        body.get("canonicalVector") == "101000101",
+        "巡检管网规范位向量 101000101",
+    )
+    check(
+        body.get("canonicalEdges") == ["e0", "e2", "e6", "e8"],
+        "巡检管网规范重复边为 e0、e2、e6、e8",
+    )
+    by_id = {e["id"]: e["classification"] for e in body.get("edges", [])}
+    check(
+        by_id
+        == {
+            "e0": "required", "e1": "never", "e2": "required",
+            "e3": "never", "e4": "optional", "e5": "never",
+            "e6": "optional", "e7": "never", "e8": "optional",
+        },
+        "巡检管网各管段归属：e0/e2 必重复，e4/e6/e8 可重复，其余从不重复",
+    )
+    route = body.get("route", [])
+    check(
+        len(route) == 13
+        and route[0].get("from") == "A"
+        and route[-1].get("to") == "A",
+        "巡检管网路线为 13 步并从 A 闭合回 A",
+    )
+    usage = {}
+    cur = "A"
+    contiguous = True
+    for st in route:
+        if st.get("from") != cur:
+            contiguous = False
+        usage[st["edgeId"]] = usage.get(st["edgeId"], 0) + 1
+        cur = st.get("to")
+    check(contiguous and cur == "A", "巡检管网路线逐步连续且终点为 A")
+    check(
+        all(usage.get(eid) == 2 for eid in ("e0", "e2", "e6", "e8"))
+        and all(usage.get(eid) == 1 for eid in ("e1", "e3", "e4", "e5", "e7")),
+        "巡检管网路线副本数与规范方案一致（e0/e2/e6/e8 各 2 次，其余各 1 次）",
+    )
+
 
 def stage(name):
     print(f"\n=== {name} ===", flush=True)
@@ -140,6 +211,56 @@ def run_domain_checks() -> bool:
     )
     check(len(r3.route) == 3 and r3.route[-1].to == "B",
           "欧拉回路从检修口出发并返回")
+
+    # six-node inspection network: two distinct optimal sets where one set
+    # admits two matching/path decompositions (the original miscount source)
+    ri = audit(
+        INSPECTION["nodes"], INSPECTION["edges"], INSPECTION["start"]
+    )
+    check(tuple(ri.odd_vertices) == tuple("ABCDEF"), "巡检管网六个奇度节点")
+    check(ri.total_length == 30 and ri.added_length == 11,
+          "巡检管网原长 30、最小增程 11（路线总长 41）")
+    check(ri.optimal_count == 2, "巡检管网不同最优集合恰为 2 个")
+    check(ri.bit_vector == "101000101", "巡检管网规范位向量 101000101")
+    by_id = {ri.edges[i].eid: ri.classification[i] for i in range(9)}
+    check(
+        by_id
+        == {
+            "e0": "required", "e1": "never", "e2": "required",
+            "e3": "never", "e4": "optional", "e5": "never",
+            "e6": "optional", "e7": "never", "e8": "optional",
+        },
+        "巡检管网各边归属：e0/e2 必，e4/e6/e8 可，e1/e3/e5/e7 否",
+    )
+    check(
+        ri.multiplicity == (2, 1, 2, 1, 1, 1, 2, 1, 2),
+        "巡检管网规范副本数 (2,1,2,1,1,1,2,1,2)",
+    )
+    check(
+        ri.route[0].frm == "A" and ri.route[-1].to == "A",
+        "巡检管网规范路线从 A 闭合回 A",
+    )
+    seen = [0] * 9
+    cur = "A"
+    contiguous = True
+    for st in ri.route:
+        if st.frm != cur:
+            contiguous = False
+        seen[st.edge_index] += 1
+        cur = st.to
+    check(
+        contiguous and cur == "A" and tuple(seen) == ri.multiplicity,
+        "巡检管网规范路线逐步连续且副本使用数与规范方案一致",
+    )
+    rr = audit(
+        INSPECTION_REVERSED["nodes"],
+        INSPECTION_REVERSED["edges"],
+        "A",
+    )
+    check(
+        rr.bit_vector == "101000101" and rr.optimal_count == 2,
+        "改变录入顺序后按标识排列结论不变",
+    )
     return True
 
 
@@ -214,6 +335,21 @@ def run_http_smoke() -> bool:
               "HTTP 返回规范位向量 001100")
         check(len(body.get("route", [])) == 8,
               "HTTP 返回 8 步闭合路线（6 原边 + 2 重复副本）")
+
+        # real POST /api/audit for the reported inspection network
+        status, body = _post(base, "/api/audit", INSPECTION)
+        check(status == 200 and body.get("ok") is True,
+              "POST /api/audit 巡检管网审计成功")
+        check_inspection(body)
+
+        status, body = _post(base, "/api/audit", INSPECTION_REVERSED)
+        check(
+            status == 200
+            and body.get("optimalCount") == 2
+            and body.get("canonicalVector") == "101000101"
+            and body.get("addedLength") == 11,
+            "HTTP 逆序录入巡检管网返回同一审计结论",
+        )
 
         status, body = _post(base, "/api/audit", TRIANGLE)
         check(body.get("ok") and body.get("addedLength") == 0,

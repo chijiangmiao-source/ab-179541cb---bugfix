@@ -231,6 +231,77 @@ def test_required_edges_in_tree():
     check_route(r, "D")
 
 
+# The reported inspection network: the same edge set admits two minimum
+# matchings/path decompositions of one of the two optimal sets, so naive
+# matching-based counting over-counts and misclassifies edges.
+INSPECTION_NETWORK = [
+    edge("e0", "F", "E", 3),
+    edge("e1", "E", "C", 1),
+    edge("e2", "C", "A", 6),
+    edge("e3", "A", "B", 6),
+    edge("e4", "B", "D", 2),
+    edge("e5", "E", "C", 5),
+    edge("e6", "D", "A", 1),
+    edge("e7", "A", "D", 5),
+    edge("e8", "B", "A", 1),
+]
+INSPECTION_NODES = list("ABCDEF")
+
+
+def test_inspection_network_two_cooptimal_sets():
+    r = audit(INSPECTION_NODES, INSPECTION_NETWORK, "A")
+    assert tuple(r.odd_vertices) == tuple("ABCDEF")
+    assert r.total_length == 30
+    assert r.added_length == 11
+    assert r.optimal_count == 2
+    # canonical 0-preferred set is {e0,e2,e6,e8} = 101000101
+    assert r.bit_vector == "101000101"
+    assert r.canonical_set == frozenset({0, 2, 6, 8})
+    want = {
+        "e0": "required", "e1": "never", "e2": "required",
+        "e3": "never", "e4": "optional", "e5": "never",
+        "e6": "optional", "e7": "never", "e8": "optional",
+    }
+    by_id = {r.edges[i].eid: r.classification[i] for i in range(9)}
+    assert by_id == want
+    # route closes at A and each edge's copy count matches the canonical set
+    check_route(r, "A")
+    assert r.route[0].frm == "A" and r.route[-1].to == "A"
+    assert len(r.route) == 13  # 9 originals + 4 duplicated copies
+    assert r.total_length + r.added_length == 41
+
+    # cross-check against the brute-force oracle
+    best, sets, _ = brute_optimal(
+        INSPECTION_NODES, INSPECTION_NETWORK
+    )
+    assert best == 11
+    assert sets == [frozenset({0, 2, 4}), frozenset({0, 2, 6, 8})]
+
+
+def test_inspection_network_input_order_independence():
+    # conclusions are keyed by identifier; entry order must not matter
+    orderings = [
+        list(reversed(INSPECTION_NETWORK)),
+        sorted(INSPECTION_NETWORK, key=lambda e: e["length"]),
+    ]
+    base = audit(INSPECTION_NODES, INSPECTION_NETWORK, "A")
+    for raw in orderings:
+        r = audit(INSPECTION_NODES, raw, "A")
+        assert [e.eid for e in r.edges] == [f"e{i}" for i in range(9)]
+        assert r.optimal_count == 2
+        assert r.added_length == 11
+        assert r.bit_vector == base.bit_vector
+        assert {r.edges[i].eid for i in r.canonical_set} == {
+            base.edges[i].eid for i in base.canonical_set
+        }
+        assert {
+            r.edges[i].eid: r.classification[i] for i in range(9)
+        } == {
+            base.edges[i].eid: base.classification[i] for i in range(9)
+        }
+        check_route(r, "A")
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------

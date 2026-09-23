@@ -212,6 +212,77 @@ def test_parallel_edges():
     check_route(r, "C")
 
 
+REPORTED_CLASSIFICATION = {
+    "e0": "required",
+    "e1": "never",
+    "e2": "required",
+    "e3": "never",
+    "e4": "optional",
+    "e5": "never",
+    "e6": "optional",
+    "e7": "never",
+    "e8": "optional",
+}
+
+
+def reported_network_edges():
+    return [
+        edge("e0", "F", "E", 3),
+        edge("e1", "E", "C", 1),
+        edge("e2", "C", "A", 6),
+        edge("e3", "A", "B", 6),
+        edge("e4", "B", "D", 2),
+        edge("e5", "E", "C", 5),
+        edge("e6", "D", "A", 1),
+        edge("e7", "A", "D", 5),
+        edge("e8", "B", "A", 1),
+    ]
+
+
+def test_reported_six_node_network_two_optima():
+    # Odd vertices A,B,C,D,E,F.  The two minimum (added length 11) duplicate
+    # sets are {e0,e2,e4} (3+6+2) and {e0,e2,e6,e8} (3+6+1+1).  The shared
+    # e0,e2 are required; e4,e6,e8 optional; the rest never duplicated.
+    # 0-preferred canonical vector (identifier order) is 101000101.
+    nodes = list("ABCDEF")
+    r = audit(nodes, reported_network_edges(), "A")
+    assert r.odd_vertices == ("A", "B", "C", "D", "E", "F")
+    assert r.total_length == 30
+    assert r.added_length == 11
+    assert r.optimal_count == 2
+    assert r.bit_vector == "101000101"
+    assert r.canonical_set == frozenset({0, 2, 6, 8})
+    assert {
+        r.edges[i].eid: r.classification[i] for i in range(9)
+    } == REPORTED_CLASSIFICATION
+    # canonical plan duplicates e0,e2,e6,e8 once each
+    assert r.multiplicity == (2, 1, 2, 1, 1, 1, 2, 1, 2)
+    check_route(r, "A")
+    assert len(r.route) == 13
+    assert sum(st.length for st in r.route) == 41
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_reported_network_independent_of_entry_order(seed):
+    # Reordering the nine edges on entry must not change any audit conclusion,
+    # since conclusions are presented in identifier order.
+    nodes = list("ABCDEF")
+    shuffled = reported_network_edges()
+    random.Random(seed).shuffle(shuffled)
+    r = audit(nodes, shuffled, "A")
+    assert [e.eid for e in r.edges] == [f"e{i}" for i in range(9)]
+    assert r.optimal_count == 2
+    assert r.added_length == 11
+    assert r.total_length == 30
+    assert r.bit_vector == "101000101"
+    assert r.canonical_set == frozenset({0, 2, 6, 8})
+    assert {
+        r.edges[i].eid: r.classification[i] for i in range(9)
+    } == REPORTED_CLASSIFICATION
+    assert r.multiplicity == (2, 1, 2, 1, 1, 1, 2, 1, 2)
+    check_route(r, "A")
+
+
 def test_required_edges_in_tree():
     # Tree A--B(4), B--C(2), B--D(2); all four vertices odd.
     # distances: AB4, CD4, AD6, AC6. Match (A,B)+(C,D) = 4+4 = 8 unique

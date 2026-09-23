@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -57,6 +58,70 @@ BAD = {
     "edges": [{"id": "x", "u": "A", "v": "A", "length": 1}],
     "start": "A",
 }
+
+# Six-node network with two tied minimum plans: added length 11 each,
+# {e0,e2,e4} and {e0,e2,e6,e8}; 0-preferred canonical vector 101000101.
+REPORTED = {
+    "nodes": ["A", "B", "C", "D", "E", "F"],
+    "edges": [
+        {"id": "e0", "u": "F", "v": "E", "length": 3},
+        {"id": "e1", "u": "E", "v": "C", "length": 1},
+        {"id": "e2", "u": "C", "v": "A", "length": 6},
+        {"id": "e3", "u": "A", "v": "B", "length": 6},
+        {"id": "e4", "u": "B", "v": "D", "length": 2},
+        {"id": "e5", "u": "E", "v": "C", "length": 5},
+        {"id": "e6", "u": "D", "v": "A", "length": 1},
+        {"id": "e7", "u": "A", "v": "D", "length": 5},
+        {"id": "e8", "u": "B", "v": "A", "length": 1},
+    ],
+    "start": "A",
+}
+
+REPORTED_CLASSIFICATION = {
+    "e0": "required",
+    "e1": "never",
+    "e2": "required",
+    "e3": "never",
+    "e4": "optional",
+    "e5": "never",
+    "e6": "optional",
+    "e7": "never",
+    "e8": "optional",
+}
+REPORTED_COPIES = {"e0": 2, "e1": 1, "e2": 2, "e3": 1, "e4": 1,
+                   "e5": 1, "e6": 2, "e7": 1, "e8": 2}
+
+
+def check_reported(body):
+    check(body.get("ok") is True, "六节点管网审计成功")
+    check(body.get("optimalCount") == 2, "并列最优方案数量为 2")
+    check(body.get("addedLength") == 11, "最小增加长度为 11")
+    check(body.get("totalLength") == 30, "管网基础总长为 30")
+    check(body.get("canonicalVector") == "101000101",
+          "规范位向量为 101000101（0 优先）")
+    check(body.get("canonicalEdges") == ["e0", "e2", "e6", "e8"],
+          "规范方案为 e0、e2、e6、e8")
+    by_id = {e["id"]: e for e in body.get("edges", [])}
+    for eid, cls in REPORTED_CLASSIFICATION.items():
+        check(by_id[eid]["classification"] == cls,
+              f"{eid} 归属为 {cls}")
+        check(by_id[eid]["copies"] == REPORTED_COPIES[eid],
+              f"{eid} 副本数为 {REPORTED_COPIES[eid]}")
+    route = body.get("route", [])
+    check(len(route) == 13, "规范路线共 13 步（9 原边 + 4 重复副本）")
+    check(route and route[0]["from"] == "A" and route[-1]["to"] == "A",
+          "路线从 A 出发并回到 A")
+    used: dict = {}
+    cur = "A"
+    ok_chain = True
+    for st in route:
+        if st["from"] != cur:
+            ok_chain = False
+        used[st["edgeId"]] = used.get(st["edgeId"], 0) + 1
+        cur = st["to"]
+    check(ok_chain and cur == "A", "路线逐步连续且闭合于 A")
+    check(used == REPORTED_COPIES, "闭合路线中各管段副本数与规范方案一致")
+    check(sum(st["length"] for st in route) == 41, "路线总长度为 41")
 
 
 def stage(name):
@@ -140,6 +205,35 @@ def run_domain_checks() -> bool:
     )
     check(len(r3.route) == 3 and r3.route[-1].to == "B",
           "欧拉回路从检修口出发并返回")
+
+    # reported six-node network: two co-optimal plans, mixed classification
+    r4 = audit(REPORTED["nodes"], REPORTED["edges"], REPORTED["start"])
+    check(r4.optimal_count == 2, "六节点管网并列最优数量为 2")
+    check(r4.added_length == 11 and r4.total_length == 30,
+          "六节点管网增程 11 / 原长 30")
+    check(r4.bit_vector == "101000101", "六节点管网规范位向量 101000101")
+    check(set(r4.canonical_set) == {0, 2, 6, 8},
+          "规范方案重复 e0、e2、e6、e8")
+    check(
+        {r4.edges[i].eid: r4.classification[i] for i in range(9)}
+        == REPORTED_CLASSIFICATION,
+        "全部九条管段归属正确（必/可/从不）",
+    )
+    check(
+        r4.route[0].frm == "A"
+        and r4.route[-1].to == "A"
+        and sum(st.length for st in r4.route) == 41,
+        "规范路线自 A 闭合，总长 41",
+    )
+
+    # entry-order independence: scramble the nine edges
+    scrambled = [dict(e) for e in REPORTED["edges"]]
+    random.Random(7).shuffle(scrambled)
+    r5 = audit(REPORTED["nodes"], scrambled, "A")
+    check(
+        (r5.optimal_count, r5.added_length, r5.bit_vector) == (2, 11, "101000101"),
+        "打乱录入顺序后审计结论不变",
+    )
     return True
 
 
@@ -214,6 +308,16 @@ def run_http_smoke() -> bool:
               "HTTP 返回规范位向量 001100")
         check(len(body.get("route", [])) == 8,
               "HTTP 返回 8 步闭合路线（6 原边 + 2 重复副本）")
+
+        status, body = _post(base, "/api/audit", REPORTED)
+        check(status == 200, "POST /api/audit 六节点管网 HTTP 200")
+        check_reported(body)
+
+        scrambled = json.loads(json.dumps(REPORTED))
+        random.Random(3).shuffle(scrambled["edges"])
+        status, body = _post(base, "/api/audit", scrambled)
+        check(status == 200, "POST /api/audit 乱序管网 HTTP 200")
+        check_reported(body)
 
         status, body = _post(base, "/api/audit", TRIANGLE)
         check(body.get("ok") and body.get("addedLength") == 0,

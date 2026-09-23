@@ -6,8 +6,8 @@ vertices to have even degree, the exact number of optimal duplicate sets, the
 canonical duplicate set (0-preferred bit vector in edge order), per-edge
 classification, and a closed Euler tour for the canonical augmentation.
 
-Exact counting without enumeration
-----------------------------------
+Exact counting of the distinct edge sets
+-----------------------------------------
 A duplicate set is a T-join: in the subgraph formed by the duplicated edges
 exactly the originally odd vertices T have odd degree.  T-join theorem:
 
@@ -16,32 +16,28 @@ exactly the originally odd vertices T have odd degree.  T-join theorem:
   * every minimum T-join decomposes into edge-disjoint shortest paths whose
     endpoint pairs form such a minimum matching.
 
-For each odd pair (i, j) let A[i][j] be the number of shortest i-j paths
-(parallel edges count separately).  Choices for the pairs of a matching are
-independent -- two shortest paths of pairs inside one minimum matching cannot
-share an edge, because their edge-union would then be a strictly cheaper
-T-join.  Hence the number of optimal sets for a matching M is the product of
-A[i][j] over its pairs, and different matchings give different sets.  The
-total count is obtained by a weighted subset DP without ever enumerating the
-sets:
+Enumerate the distinct optimal joins by subset DP over the k odd vertices,
+gated by the standard minimum-matching cost DP:
 
-    C[S] = sum over min-cost partners j of the first vertex:
-               A[i][j] * C[S \\ {i, j}]
+    F[S] = { p xor q | j is a partner of the lowest vertex i of S with
+                       dist(i, j) + cost[S \\ {i, j}] == cost[S],
+                       p a shortest i-j path (edge mask),
+                       q in F[S \\ {i, j}] }
 
-For per-edge classification, let B_e[i][j] be the number of shortest i-j
-paths that use edge e (forward/backward shortest-path-count product through
-the edge).  A second DP G_e[S] counts optimal sets for subproblem S that
-contain e, using B_e for the pair whose path carries e and A - B_e otherwise:
+with F[0] = {0}.  Every entry is the *whole set* of distinct optimal masks
+for that subproblem -- retaining only one representative is wrong, because
+two optimal joins of a subproblem can extend differently: one may share an
+edge with the new path (the xor cancels it) while the other does not, and
+both results stay optimal for the full problem.  Symmetric difference is
+exactly the edge-set operation of chaining a path onto a join, and integer
+masks deduplicate identical sets reached through different decompositions
+(parallel edges / equal-length paths).  With at most 18 odd vertices and 32
+edges this stays small (sub-second on the worst unit-metric case).
 
-    G_e[S] = sum over min-cost partners j:
-               B_e[i][j] * C[S'] + (A[i][j] - B_e[i][j]) * G_e[S']
-
-Edge e is required when G_e[T] == C[T], optional for 0 < G_e[T] < C[T], and
-never duplicated when G_e[T] == 0.
-
-The canonical set is built greedily in edge order: bit p is 0 whenever an
-optimum T-join still exists with the edges pinned so far, the newly forced
-edges toggling the parity target.
+The total number is |F[T]|.  The canonical member is the one whose bit
+vector is lexicographically smallest in edge-identifier order with 0
+preferred.  Per-edge classification comes from the intersection (required)
+and union (optional / never) of all members of F[T].
 """
 
 from __future__ import annotations
@@ -458,11 +454,25 @@ def enumerate_optimal_tjoins(
 ):
     """All distinct minimum T-join masks for the odd vertices.
 
-    dp[mask] is the set of distinct edge masks of optimal T-joins pairing
-    exactly the odd vertices in ``mask``.  Anchor the lowest-index vertex i
-    and combine a shortest i-j path with an optimal solution of the remaining
-    mask via symmetric difference; integer masks deduplicate automatically.
-    The matching cost DP gates which partners j can occur in an optimum.
+    dp[mask] is the *set* of distinct edge masks of all optimal T-joins that
+    pair exactly the odd vertices in ``mask``.  Anchor the lowest-index
+    vertex i and form, for every partner j that can occur in an optimum (gated
+    by the matching cost DP), the symmetric difference of every shortest i-j
+    path with every optimal join of the remaining mask:
+
+        dp[mask] = { p xor q | j optimal partner,
+                                p in shortestPaths(i, j),
+                                q in dp[mask \\ {i, j}] }
+
+    Keeping the whole set -- not only one canonical representative -- is
+    essential: two optimal joins of a subproblem can differ while still
+    producing distinct optimal joins of the full problem (e.g. one sub-join
+    extends with a shared edge and the other does not).  Integer edge masks
+    deduplicate identical sets produced via different decompositions.
+
+    Returns (count, canonical_mask, union_mask, intersection_mask) where the
+    canonical mask is the 0-preferred lexicographically smallest bit vector
+    in edge-identifier order.
     """
     k = len(odd)
     size = 1 << k
@@ -490,8 +500,8 @@ def enumerate_optimal_tjoins(
             bits ^= bit
         return rank
 
-    dp: List[Optional[Tuple[int, int, int, int]]] = [None] * size
-    dp[0] = (1, 0, 0, 0)
+    dp: List[Optional[FrozenSet[int]]] = [None] * size
+    dp[0] = frozenset({0})
     for mask in range(1, size):
         if mask.bit_count() & 1:
             continue
@@ -499,10 +509,8 @@ def enumerate_optimal_tjoins(
         i = ib.bit_length() - 1
         rest0 = mask ^ ib
         target_cost = costdp[mask]
-        total = 0
-        canonical: Optional[int] = None
-        in_any = 0
-        in_all: Optional[int] = None
+        if target_cost >= INF:
+            continue
         represented: set[int] = set()
         bits = rest0
         while bits:
@@ -514,25 +522,26 @@ def enumerate_optimal_tjoins(
                 continue
             if dist_matrix[i][j] + costdp[sub] != target_cost:
                 continue
-            sub_summary = dp[sub]
-            if sub_summary is None:
+            sub_sets = dp[sub]
+            if not sub_sets:
                 continue
-            sub_count, sub_canonical, sub_any, sub_all = sub_summary
             for pmask in paths_between(i, j):
-                candidate = pmask ^ sub_canonical
-                if candidate in represented:
-                    continue
-                represented.add(candidate)
-                if canonical is None or vector_rank(candidate) < vector_rank(canonical):
-                    canonical = candidate
-                candidate_any = pmask | sub_any
-                candidate_all = pmask | sub_all
-                total += sub_count
-                in_any |= candidate_any
-                in_all = candidate_all if in_all is None else in_all & candidate_all
-        if canonical is not None and in_all is not None:
-            dp[mask] = (total, canonical, in_any, in_all)
-    return dp[size - 1]
+                for sub_mask in sub_sets:
+                    represented.add(pmask ^ sub_mask)
+        if represented:
+            dp[mask] = frozenset(represented)
+
+    full_sets = dp[size - 1]
+    if not full_sets:
+        return 0, 0, 0, 0
+
+    canonical = min(full_sets, key=vector_rank)
+    in_any = 0
+    in_all: Optional[int] = None
+    for edge_mask in full_sets:
+        in_any |= edge_mask
+        in_all = edge_mask if in_all is None else in_all & edge_mask
+    return len(full_sets), canonical, in_any, in_all
 
 
 # ---------------------------------------------------------------------------
